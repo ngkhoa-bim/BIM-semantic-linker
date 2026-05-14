@@ -1,0 +1,18 @@
+# BIM Semantic Linker — Backend Dependencies
+# Python 3.11+
+
+flask==3.0.3
+werkzeug>=3.0.3
+
+# Neo4j Aura driver
+neo4j==5.20.0
+
+# IFC parsing (binary wheel — không cần build)
+ifcopenshell
+
+# Anthropic Claude API
+google-generativeai>=0.7.0
+
+# Môi trường (đọc .env khi chạy local)
+python-dotenv>=1.0.1
+gunicorn>=22.0.0
