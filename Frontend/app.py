@@ -29,10 +29,16 @@ st.set_page_config(
 # Backend URL — ưu tiên: st.secrets > env var > localhost
 # ──────────────────────────────────────────────────────────────
 def get_backend_url() -> str:
+    # Ưu tiên biến môi trường trên Render
+    env_url = os.environ.get("BACKEND_URL")
+    if env_url:
+        return env_url.rstrip("/")
+
+    # Chỉ dùng st.secrets khi chạy trên Streamlit Cloud/local có secrets.toml
     try:
-        return st.secrets["BACKEND_URL"].rstrip("/")
+        return st.secrets.get("BACKEND_URL", "http://localhost:7860").rstrip("/")
     except Exception:
-        return os.environ.get("BACKEND_URL", "http://localhost:7860").rstrip("/")
+        return "http://localhost:7860"
 
 BACKEND = get_backend_url()
 
