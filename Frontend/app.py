@@ -136,7 +136,7 @@ def api_ingest_ifc(project_id: str, file_bytes: bytes, filename: str) -> dict:
         r = requests.post(
             f"{BACKEND}/api/projects/{project_id}/ifc/ingest",
             files={"file": (filename, file_bytes, "application/octet-stream")},
-            timeout=180,
+            timeout=600,
         )
         r.raise_for_status()
         return r.json()
