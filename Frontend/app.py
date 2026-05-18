@@ -519,7 +519,30 @@ with tab_docs:
                 f"✅ **{len(auto_confirmed_list)}** liên kết đã được xác nhận tự động "
                 f"(ID_BASED/HYBRID, confidence ≥ 85%) và ghi vào Neo4j."
             )
- 
+
+            # Tổng hợp các nhóm đã auto-confirm theo matched_anchor
+            auto_summary = {}
+            for s in auto_confirmed_list:
+                key = s.get("matched_anchor") or s.get("reference") or "Không xác định"
+                auto_summary[key] = auto_summary.get(key, 0) + 1
+
+            auto_summary_df = (
+                pd.DataFrame(
+                    [
+                        {"Loại cấu kiện / Reference": k, "Số links": v}
+                        for k, v in auto_summary.items()
+                    ]
+                )
+                .sort_values("Số links", ascending=False)
+                .reset_index(drop=True)
+            )
+
+            with st.expander("📌 Chi tiết các nhóm đã được tự động xác nhận", expanded=True):
+                st.markdown(
+                    "Đã xét duyệt/tự động xác nhận toàn bộ các nhóm liên kết sau:"
+                )
+                st.dataframe(auto_summary_df, use_container_width=True)
+
         # ── Chọn chế độ xem ──────────────────────────────────────────────
         # "Nhóm" phù hợp cho Cấp 2 (ID_BASED/HYBRID số lượng lớn, confidence tốt).
         # "Từng đề xuất" phù hợp cho Cấp 3 (SEMANTIC, cần xem xét kỹ từng cái).
@@ -554,7 +577,30 @@ with tab_docs:
             total_pending = len(candidates)
  
             if not grouped:
-                st.success("🎉 Đã xét duyệt toàn bộ đề xuất Cấp 2 trong phiên này!")
+                st.success(
+                    "🎉 Không còn đề xuất Cấp 2 cần xét duyệt thủ công. "
+                    "Các liên kết đủ tin cậy đã được tự động xác nhận ở Cấp 1."
+                )
+
+                if auto_confirmed_list:
+                    auto_summary = {}
+                    for s in auto_confirmed_list:
+                        key = s.get("matched_anchor") or "Không xác định"
+                        auto_summary[key] = auto_summary.get(key, 0) + 1
+
+                    auto_summary_df = (
+                        pd.DataFrame(
+                            [
+                                {"Loại cấu kiện / Reference": k, "Số links": v}
+                                for k, v in auto_summary.items()
+                            ]
+                        )
+                        .sort_values("Số links", ascending=False)
+                        .reset_index(drop=True)
+                    )
+
+                    st.markdown("**Các nhóm đã được tự động xác nhận:**")
+                    st.dataframe(auto_summary_df, use_container_width=True)
             else:
                 st.subheader(
                     f"💡 {total_groups} nhóm cấu kiện · {total_pending} đề xuất chờ xét duyệt"
