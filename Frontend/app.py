@@ -14,6 +14,7 @@ import pandas as pd
 import PyPDF2
 import docx
 import streamlit as st
+from itertools import groupby
 
 # ──────────────────────────────────────────────────────────────
 # Cấu hình trang
@@ -29,12 +30,10 @@ st.set_page_config(
 # Backend URL — ưu tiên: st.secrets > env var > localhost
 # ──────────────────────────────────────────────────────────────
 def get_backend_url() -> str:
-    # Ưu tiên biến môi trường trên Render
     env_url = os.environ.get("BACKEND_URL")
     if env_url:
         return env_url.rstrip("/")
 
-    # Chỉ dùng st.secrets khi chạy trên Streamlit Cloud/local có secrets.toml
     try:
         return st.secrets.get("BACKEND_URL", "http://localhost:7860").rstrip("/")
     except Exception:
@@ -163,7 +162,7 @@ def api_analyze(project_id: str, doc_name: str, doc_text: str) -> dict:
         r = requests.post(
             f"{BACKEND}/api/projects/{project_id}/documents/analyze",
             json={"document_name": doc_name, "document_text": doc_text},
-            timeout=180,
+            timeout=300,
         )
         r.raise_for_status()
         return r.json()
@@ -179,6 +178,42 @@ def api_confirm_link(project_id: str, payload: dict) -> dict:
             f"{BACKEND}/api/projects/{project_id}/links/confirm",
             json=payload,
             timeout=30,
+        )
+        r.raise_for_status()
+        return r.json()
+    except requests.HTTPError as e:
+        return {"error": f"HTTP {e.response.status_code}: {e.response.text[:200]}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#   - Thêm tham số doc_id, doc_name, suggestions_data
+#   - Backend cần suggestions_data để ghi DocumentLink đầy đủ vào Neo4j
+#     (element_global_id, confidence, method, evidence, v.v.)
+#   - Khi action="REJECTED", suggestions_data không cần thiết → truyền [] là được
+# ─────────────────────────────────────────────────────────────────────────────
+def api_confirm_group( project_id: str, suggestion_ids: list, action: str, doc_id: str = "", doc_name: str = "", suggestions_data: list = None,) -> dict:
+    """
+    Xác nhận hoặc từ chối một nhóm suggestions cùng lúc.
+    Args:
+        project_id:      ID dự án trong Neo4j
+        suggestion_ids:  Danh sách suggestion_id cần xử lý
+        action:          "CONFIRMED" hoặc "REJECTED"
+        doc_id:          document_id từ session_state (cần khi CONFIRMED)
+        doc_name:        Tên file tài liệu (cần khi CONFIRMED)
+        suggestions_data: Dữ liệu đầy đủ các suggestion (cần khi CONFIRMED để Backend biết element_global_id, confidence, v.v.)
+    """
+    try:
+        r = requests.post(
+            f"{BACKEND}/api/projects/{project_id}/links/confirm-group",
+            json={
+                "suggestion_ids":  suggestion_ids,
+                "action":          action,
+                "document_id":     doc_id,
+                "document_name":   doc_name,
+                "suggestions_data": suggestions_data or [],
+            },
+            timeout=60,  # group có thể ghi nhiều records → timeout dài hơn single confirm
         )
         r.raise_for_status()
         return r.json()
@@ -418,108 +453,303 @@ with tab_docs:
                     st.warning(f"⚠️ {msg}")
 
     # ──────────────────────────────────────────────────────────
-    # Hiển thị suggestions — mỗi suggestion = 1 card
+    # Nhóm suggestions theo matched_anchor để hiển thị dạng group
+    #   - Hiển thị banner tóm tắt 3 cấp ngay sau khi nhận kết quả từ Backend.
+    #   - Toggle giữa "Grouped view" (Cấp 1 & 2) và "Individual view" (Cấp 3).
+    #   - Grouped view: mỗi anchor_value = 1 container, có nút group-confirm.
+    #   - Individual view: mỗi suggestion = 1 card, dùng confirm_link đơn lẻ.
     # ──────────────────────────────────────────────────────────
     if st.session_state.suggestions:
         st.divider()
-
-        # Bộ lọc phương pháp
-        all_methods = sorted({s.get("method", "?") for s in st.session_state.suggestions})
+ 
+        # ── Bộ lọc phương pháp (giữ nguyên) ─────────────────────────────
+        all_methods = sorted({
+            s.get("method", "?") for s in st.session_state.suggestions
+        })
         selected_methods = st.multiselect(
             "🔎 Lọc theo phương pháp matching",
             options=all_methods,
             default=all_methods,
         )
-
-        # Lọc bỏ các suggestions đã xử lý
-        active_suggestions = [
+ 
+        # ── Banner tóm tắt 3 cấp ─────────────────────────────────────────
+        # Hiển thị ngay dưới bộ lọc để user có cái nhìn tổng quan trước khi xét duyệt
+        auto_confirmed_list = [
             s for s in st.session_state.suggestions
-            if s.get("method") in selected_methods
+            if s.get("status") == "AUTO_CONFIRMED"
+            and s.get("method") in selected_methods
+        ]
+        group_pending_list = [
+            s for s in st.session_state.suggestions
+            if s.get("tier") == 2
+            and s.get("method") in selected_methods
             and s.get("ui_id") not in st.session_state.confirmed_uids
             and s.get("ui_id") not in st.session_state.skipped_uids
         ]
-
-        st.subheader(f"💡 {len(active_suggestions)} đề xuất chờ xét duyệt")
-
-        if not active_suggestions:
-            st.success("🎉 Đã xét duyệt toàn bộ đề xuất trong phiên này!")
-
-        for s in active_suggestions:
-            uid        = s.get("ui_id", str(uuid.uuid4()))
-            conf       = s.get("confidence", 0.0)
-            method     = s.get("method", "?")
-            elem_name  = s.get("element_name", "Unknown")
-            elem_gid   = s.get("element_global_id", "")
-            anchor_val = s.get("matched_anchor", "")
-            evidence   = s.get("evidence", "")
-
-            # Badge màu theo phương pháp và confidence
-            METHOD_BADGE = {"ID_BASED": "🟢", "SEMANTIC": "🔵", "HYBRID": "🟡"}
-            CONF_BADGE   = "🟢" if conf >= 0.80 else ("🟡" if conf >= 0.50 else "🔴")
-            method_badge = METHOD_BADGE.get(method, "⚪")
-
-            with st.container(border=True):
-                left, right = st.columns([7, 2])
-
-                with left:
-                    # Tiêu đề card
-                    st.markdown(
-                        f"**📄 Tài liệu:** `{st.session_state.current_file_name}`  \n"
-                        f"**🧱 Cấu kiện:** `{elem_name}`  \n"
-                        f"**🆔 GlobalId:** `{elem_gid}`  \n"
-                        f"**🔑 Anchor khớp:** `{anchor_val}`"
+        manual_pending_list = [
+            s for s in st.session_state.suggestions
+            if s.get("tier") == 3
+            and s.get("method") in selected_methods
+            and s.get("ui_id") not in st.session_state.confirmed_uids
+            and s.get("ui_id") not in st.session_state.skipped_uids
+        ]
+ 
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric(
+                "⚡ Cấp 1 — Tự động xác nhận",
+                len(auto_confirmed_list),
+                help="ID_BASED/HYBRID, confidence ≥ 85% — đã ghi vào Neo4j tự động",
+            )
+        with c2:
+            st.metric(
+                "🗂️ Cấp 2 — Group-confirm",
+                len(group_pending_list),
+                help="ID_BASED/HYBRID, confidence 70–85% — bấm 1 lần cho cả nhóm",
+            )
+        with c3:
+            st.metric(
+                "🔬 Cấp 3 — Manual review",
+                len(manual_pending_list),
+                help="SEMANTIC hoặc confidence < 70% — xem xét từng đề xuất",
+            )
+ 
+        if auto_confirmed_list:
+            st.success(
+                f"✅ **{len(auto_confirmed_list)}** liên kết đã được xác nhận tự động "
+                f"(ID_BASED/HYBRID, confidence ≥ 85%) và ghi vào Neo4j."
+            )
+ 
+        # ── Chọn chế độ xem ──────────────────────────────────────────────
+        # "Nhóm" phù hợp cho Cấp 2 (ID_BASED/HYBRID số lượng lớn, confidence tốt).
+        # "Từng đề xuất" phù hợp cho Cấp 3 (SEMANTIC, cần xem xét kỹ từng cái).
+        view_mode = st.radio(
+            "Chế độ xem",
+            [
+                "🗂️ Nhóm theo loại cấu kiện (Cấp 2)",
+                "🔬 Từng đề xuất riêng lẻ (Cấp 3 — Semantic)",
+            ],
+            horizontal=True,
+        )
+ 
+        # ── CHẾ ĐỘ NHÓM — Cấp 2 ─────────────────────────────────────────
+        if "Nhóm" in view_mode:
+            # Lấy suggestions cần group-confirm (tier=2, chưa xử lý)
+            # Nếu user muốn xem Cấp 1 trong nhóm để có thể override, bỏ filter tier==2
+            candidates = [
+                s for s in st.session_state.suggestions
+                if s.get("method") in selected_methods
+                and s.get("status") != "AUTO_CONFIRMED"   # ẩn auto-confirmed khỏi review
+                and s.get("ui_id") not in st.session_state.confirmed_uids
+                and s.get("ui_id") not in st.session_state.skipped_uids
+            ]
+ 
+            # Nhóm theo matched_anchor (loại cấu kiện)
+            grouped: dict = {}
+            for s in candidates:
+                key = s.get("matched_anchor", "Không xác định")
+                grouped.setdefault(key, []).append(s)
+ 
+            total_groups = len(grouped)
+            total_pending = len(candidates)
+ 
+            if not grouped:
+                st.success("🎉 Đã xét duyệt toàn bộ đề xuất Cấp 2 trong phiên này!")
+            else:
+                st.subheader(
+                    f"💡 {total_groups} nhóm cấu kiện · {total_pending} đề xuất chờ xét duyệt"
+                )
+ 
+                # Nút "Đồng ý tất cả" ở cấp toàn bộ (cho user lười 😄)
+                col_all1, col_all2, _ = st.columns([2, 2, 4])
+                if col_all1.button("✅ Đồng ý TẤT CẢ nhóm", type="primary"):
+                    all_ids  = [s["suggestion_id"] for s in candidates if s.get("suggestion_id")]
+                    res = api_confirm_group(
+                        project_id, all_ids, "CONFIRMED",
+                        doc_id=st.session_state.current_doc_id,
+                        doc_name=st.session_state.current_file_name,
+                        suggestions_data=candidates,
                     )
-
-                    # Confidence + method
-                    st.markdown(
-                        f"**Độ tin cậy:** {CONF_BADGE} `{conf:.0%}`  &nbsp;  "
-                        f"**Phương pháp:** {method_badge} `{method}`"
-                    )
-
-                    # Evidence
-                    if evidence:
-                        st.caption(
-                            f"📎 **Bằng chứng:** _{evidence[:250]}_"
-                            + ("…" if len(evidence) > 250 else "")
-                        )
-
-                with right:
-                    # Nút Đồng ý — gọi Backend để persist
-                    if st.button(
-                        "✅ Đồng ý",
-                        key=f"confirm_{uid}",
-                        type="primary",
-                        use_container_width=True,
-                    ):
-                        confirm_payload = {
-                            "document_id":       st.session_state.current_doc_id,
-                            "document_name":     st.session_state.current_file_name,
-                            "element_global_id": elem_gid,
-                            "suggestion_id":     s.get("suggestion_id", uid),
-                            "confidence":        conf,
-                            "method":            method,
-                            "evidence":          evidence,
-                            "confirmed_by":      "human_via_ui",
-                        }
-                        with st.spinner("Đang lưu vào Neo4j..."):
-                            res = api_confirm_link(project_id, confirm_payload)
-
-                        if "error" in res:
-                            st.error(f"❌ {res['error']}")
-                        else:
-                            st.session_state.confirmed_uids.add(uid)
-                            st.toast(f"🎉 Đã lưu liên kết: {elem_name}", icon="✅")
-                            st.rerun()
-
-                    # Nút Bỏ qua — chỉ ẩn khỏi UI, không ghi DB
-                    if st.button(
-                        "❌ Bỏ qua",
-                        key=f"skip_{uid}",
-                        use_container_width=True,
-                    ):
-                        st.session_state.skipped_uids.add(uid)
+                    if "error" in res:
+                        st.error(f"❌ {res['error']}")
+                    else:
+                        for s in candidates:
+                            st.session_state.confirmed_uids.add(s.get("ui_id", ""))
+                        st.toast(f"✅ Đã xác nhận tất cả {total_pending} đề xuất", icon="✅")
                         st.rerun()
-
+ 
+                if col_all2.button("❌ Bỏ qua TẤT CẢ nhóm"):
+                    all_ids = [s["suggestion_id"] for s in candidates if s.get("suggestion_id")]
+                    api_confirm_group(
+                        project_id, all_ids, "REJECTED",
+                        doc_id=st.session_state.current_doc_id,
+                        doc_name=st.session_state.current_file_name,
+                    )
+                    for s in candidates:
+                        st.session_state.skipped_uids.add(s.get("ui_id", ""))
+                    st.rerun()
+ 
+                st.divider()
+ 
+                # Render từng nhóm — mỗi nhóm = 1 container
+                for anchor_value, group in sorted(grouped.items()):
+                    methods_in_group = {s.get("method", "?") for s in group}
+                    max_conf = max(s.get("confidence", 0) for s in group)
+                    min_conf = min(s.get("confidence", 0) for s in group)
+ 
+                    METHOD_BADGE = {"ID_BASED": "🟢", "HYBRID": "🟡", "SEMANTIC": "🔵"}
+                    method_display = "  ·  ".join(
+                        f"{METHOD_BADGE.get(m, '⚪')} {m}" for m in sorted(methods_in_group)
+                    )
+ 
+                    with st.container(border=True):
+                        # Header của nhóm
+                        col_h, col_btn = st.columns([6, 3])
+                        with col_h:
+                            st.markdown(
+                                f"**🔖 Anchor:** `{anchor_value}`  \n"
+                                f"**{len(group)}** cấu kiện  ·  "
+                                f"{method_display}  ·  "
+                                f"Confidence: `{min_conf:.0%}` – `{max_conf:.0%}`"
+                            )
+ 
+                        with col_btn:
+                            btn_col1, btn_col2 = st.columns(2)
+ 
+                            # Nút Đồng ý cho cả nhóm này
+                            if btn_col1.button(
+                                f"✅ Đồng ý ({len(group)})",
+                                key=f"grp_yes_{anchor_value}",
+                                type="primary",
+                                use_container_width=True,
+                            ):
+                                ids = [s["suggestion_id"] for s in group if s.get("suggestion_id")]
+                                with st.spinner(f"Đang lưu {len(group)} liên kết..."):
+                                    res = api_confirm_group(
+                                        project_id, ids, "CONFIRMED",
+                                        doc_id=st.session_state.current_doc_id,
+                                        doc_name=st.session_state.current_file_name,
+                                        suggestions_data=group,
+                                    )
+                                if "error" in res:
+                                    st.error(f"❌ {res['error']}")
+                                else:
+                                    for s in group:
+                                        st.session_state.confirmed_uids.add(s.get("ui_id", ""))
+                                    st.toast(
+                                        f"✅ Đã xác nhận {len(group)} cấu kiện `{anchor_value}`",
+                                        icon="✅",
+                                    )
+                                    st.rerun()
+ 
+                            # Nút Bỏ qua cả nhóm này
+                            if btn_col2.button(
+                                f"❌ Bỏ qua ({len(group)})",
+                                key=f"grp_no_{anchor_value}",
+                                use_container_width=True,
+                            ):
+                                ids = [s["suggestion_id"] for s in group if s.get("suggestion_id")]
+                                api_confirm_group(
+                                    project_id, ids, "REJECTED",
+                                    doc_id=st.session_state.current_doc_id,
+                                    doc_name=st.session_state.current_file_name,
+                                )
+                                for s in group:
+                                    st.session_state.skipped_uids.add(s.get("ui_id", ""))
+                                st.rerun()
+ 
+                        # Chi tiết từng instance — có thể expand để xem hoặc override
+                        with st.expander(f"🔍 Xem chi tiết {len(group)} instance"):
+                            for item in group:
+                                item_conf   = item.get("confidence", 0)
+                                item_method = item.get("method", "?")
+                                item_gid    = item.get("element_global_id", "?")
+                                item_name   = item.get("element_name", "?")
+ 
+                                CONF_BADGE  = "🟢" if item_conf >= 0.80 else ("🟡" if item_conf >= 0.50 else "🔴")
+                                st.text(
+                                    f"  {CONF_BADGE}  {item_conf:.0%}  |  "
+                                    f"{item_method}  |  "
+                                    f"{item_name[:45]}  |  "
+                                    f"GlobalId: {item_gid}"
+                                )
+ 
+        # ── CHẾ ĐỘ TỪNG ĐỀ XUẤT — Cấp 3 (Manual review) ────────────────
+        else:
+            # Chỉ lấy suggestions cần manual review (tier=3 hoặc tất cả tùy filter)
+            manual_candidates = [
+                s for s in st.session_state.suggestions
+                if s.get("method") in selected_methods
+                and s.get("status") != "AUTO_CONFIRMED"
+                and s.get("ui_id") not in st.session_state.confirmed_uids
+                and s.get("ui_id") not in st.session_state.skipped_uids
+            ]
+ 
+            if not manual_candidates:
+                st.success("🎉 Đã xét duyệt toàn bộ đề xuất trong phiên này!")
+ 
+            st.subheader(f"🔬 {len(manual_candidates)} đề xuất cần xem xét thủ công")
+ 
+            for s in manual_candidates:
+                uid        = s.get("ui_id", str(uuid.uuid4()))
+                conf       = s.get("confidence", 0.0)
+                method     = s.get("method", "?")
+                elem_name  = s.get("element_name", "Unknown")
+                elem_gid   = s.get("element_global_id", "")
+                anchor_val = s.get("matched_anchor", "")
+                evidence   = s.get("evidence", "")
+ 
+                METHOD_BADGE = {"ID_BASED": "🟢", "SEMANTIC": "🔵", "HYBRID": "🟡"}
+                CONF_BADGE   = "🟢" if conf >= 0.80 else ("🟡" if conf >= 0.50 else "🔴")
+ 
+                with st.container(border=True):
+                    left, right = st.columns([7, 2])
+ 
+                    with left:
+                        st.markdown(
+                            f"**📄 Tài liệu:** `{st.session_state.current_file_name}`  \n"
+                            f"**🧱 Cấu kiện:** `{elem_name}`  \n"
+                            f"**🆔 GlobalId:** `{elem_gid}`  \n"
+                            f"**🔑 Anchor khớp:** `{anchor_val}`"
+                        )
+                        st.markdown(
+                            f"**Độ tin cậy:** {CONF_BADGE} `{conf:.0%}`  &nbsp;  "
+                            f"**Phương pháp:** {METHOD_BADGE.get(method, '⚪')} `{method}`"
+                        )
+                        if evidence:
+                            st.caption(
+                                f"📎 **Bằng chứng:** _{evidence[:250]}_"
+                                + ("…" if len(evidence) > 250 else "")
+                            )
+ 
+                    with right:
+                        # Confirm đơn lẻ — dùng confirm_link endpoint cũ
+                        if st.button("✅ Đồng ý", key=f"yes_{uid}", type="primary",
+                                     use_container_width=True):
+                            confirm_payload = {
+                                "document_id":       st.session_state.current_doc_id,
+                                "document_name":     st.session_state.current_file_name,
+                                "element_global_id": elem_gid,
+                                "suggestion_id":     s.get("suggestion_id", uid),
+                                "confidence":        conf,
+                                "method":            method,
+                                "evidence":          evidence,
+                                "confirmed_by":      "human_via_ui",
+                            }
+                            with st.spinner("Đang lưu vào Neo4j..."):
+                                res = api_confirm_link(project_id, confirm_payload)
+                            if "error" in res:
+                                st.error(f"❌ {res['error']}")
+                            else:
+                                st.session_state.confirmed_uids.add(uid)
+                                st.toast(f"🎉 Đã lưu: {elem_name}", icon="✅")
+                                st.rerun()
+ 
+                        if st.button("❌ Bỏ qua", key=f"no_{uid}",
+                                     use_container_width=True):
+                            st.session_state.skipped_uids.add(uid)
+                            st.rerun()
+        st.divider()
 
 # ══════════════════════════════════════════════════════════════
 # TAB 3 — Confirmed Links
