@@ -161,8 +161,8 @@ def api_analyze(project_id: str, doc_name: str, doc_text: str) -> dict:
     try:
         r = requests.post(
             f"{BACKEND}/api/projects/{project_id}/documents/analyze",
-            json={"document_name": doc_name, "document_text": doc_text},
-            timeout=300,
+            json={"document_name": doc_name, "document_text": doc_text,"auto_confirm_threshold": 0.85},
+            timeout=600,
         )
         r.raise_for_status()
         return r.json()
