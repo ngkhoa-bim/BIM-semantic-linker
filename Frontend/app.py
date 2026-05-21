@@ -161,8 +161,8 @@ def api_analyze(project_id: str, doc_name: str, doc_text: str) -> dict:
     try:
         r = requests.post(
             f"{BACKEND}/api/projects/{project_id}/documents/analyze",
-            json={"document_name": doc_name, "document_text": doc_text,"auto_confirm_threshold": 0.85},
-            timeout=600,
+            json={"document_name": doc_name, "document_text": doc_text},
+            timeout=300,
         )
         r.raise_for_status()
         return r.json()
@@ -185,6 +185,68 @@ def api_confirm_link(project_id: str, payload: dict) -> dict:
         return {"error": f"HTTP {e.response.status_code}: {e.response.text[:200]}"}
     except Exception as e:
         return {"error": str(e)}
+
+def api_export_linkset(project_id: str, fmt: str = "turtle") -> requests.Response | None:
+    """
+    Gọi GET /api/projects/<pid>/links/export?format=<fmt>
+    Trả về requests.Response thô (để lấy .content bytes),
+    hoặc None nếu có lỗi kết nối.
+    """
+    try:
+        r = requests.get(
+            f"{BACKEND}/api/projects/{project_id}/links/export",
+            params={"format": fmt, "save": "false"},
+            timeout=120,
+        )
+        r.raise_for_status()
+        return r
+    except requests.HTTPError as e:
+        st.error(f"❌ HTTP {e.response.status_code}: {e.response.text[:300]}")
+        return None
+    except Exception as e:
+        st.error(f"❌ Lỗi kết nối: {e}")
+        return None
+
+def api_export_container(project_id: str) -> requests.Response | None:
+    """
+    Gọi GET /api/projects/<pid>/container/export
+    Trả về requests.Response thô chứa nội dung Container.rdf,
+    hoặc None nếu có lỗi.
+    """
+    try:
+        r = requests.get(
+            f"{BACKEND}/api/projects/{project_id}/container/export",
+            params={"save": "false"},
+            timeout=60,
+        )
+        r.raise_for_status()
+        return r
+    except requests.HTTPError as e:
+        st.error(f"❌ HTTP {e.response.status_code}: {e.response.text[:300]}")
+        return None
+    except Exception as e:
+        st.error(f"❌ Lỗi kết nối: {e}")
+        return None
+
+def api_package_icdd(project_id: str) -> requests.Response | None:
+    """
+    Gọi GET /api/projects/<pid>/icdd/package
+    Trả về requests.Response thô chứa file ZIP (.icdd),
+    hoặc None nếu có lỗi.
+    """
+    try:
+        r = requests.get(
+            f"{BACKEND}/api/projects/{project_id}/icdd/package",
+            timeout=180,
+        )
+        r.raise_for_status()
+        return r
+    except requests.HTTPError as e:
+        st.error(f"❌ HTTP {e.response.status_code}: {e.response.text[:300]}")
+        return None
+    except Exception as e:
+        st.error(f"❌ Lỗi kết nối: {e}")
+        return None
 
 # ─────────────────────────────────────────────────────────────────────────────
 #   - Thêm tham số doc_id, doc_name, suggestions_data
@@ -300,10 +362,11 @@ st.caption(
     "— ID-based Matching + Semantic Discovery + Human Validation"
 )
 
-tab_ifc, tab_docs, tab_links = st.tabs([
-    "📦 1. Nạp Mô hình IFC",
+tab_ifc, tab_docs, tab_links, tab_icdd = st.tabs([
+    "🏗️ 1. Nạp Mô hình IFC",
     "📄 2. Phân tích Tài liệu",
     "🔗 3. Liên kết đã xác nhận",
+    "📦 4. Xuất ICDD / Linkset",
 ])
 
 
@@ -873,3 +936,299 @@ with tab_links:
                 for s in confirmed_this_session
             ])
             st.dataframe(df_session, use_container_width=True)
+# ══════════════════════════════════════════════════════════════
+# TAB 4 — Xuất ICDD / Linkset
+# ══════════════════════════════════════════════════════════════
+
+with tab_icdd:
+
+    st.subheader("📦 Xuất ICDD Container theo ISO 21597-1")
+    st.caption(
+        "Đóng gói toàn bộ liên kết ngữ nghĩa đã xác nhận thành "
+        "chuẩn **ISO 21597-1 (ICDD)** để trao đổi liên thông với "
+        "các phần mềm BIM khác (Bimspot, Trimble Connect, v.v.)"
+    )
+
+    # ── Thông tin nền về ICDD ──────────────────────────────────
+    with st.expander(" ICDD là gì? Tại sao cần chuẩn này?", expanded=False):
+        st.markdown("""
+**ICDD (Information Container for linked Document Delivery)** là chuẩn ISO 21597-1:2020,
+định nghĩa cách đóng gói thông tin BIM để trao đổi giữa các bên trong dự án.
+
+Một ICDD package là một file ZIP (đổi đuôi thành `.icdd`) với 4 thư mục cố định:
+
+| Thư mục | Nội dung | Bắt buộc? |
+|---|---|---|
+| `Container.rdf` | File index mô tả toàn bộ package | ✅ Bắt buộc |
+| `Payload Documents/` | Tài liệu gốc: PDF, DOCX, XLSX, IFC | ✅ Bắt buộc |
+| `Linkset Documents/` | File `.ttl` chứa liên kết ngữ nghĩa | ✅ Bắt buộc |
+| `Ontology Resources/` | Ontology tham chiếu: bot.ttl, IFC2X3_Final.ttl | 📌 Khuyến nghị |
+
+Namespace của ứng dụng này dùng domain thật:
+`https://bim-semantic-linker.onrender.com/` — đây là **Linked Data URI** hợp lệ, 
+không phải URN tạm thời.
+        """)
+
+    st.divider()
+
+    # ══════════════════════════════════════════════════════════
+    # PHẦN A — Export Linkset (file RDF mô tả liên kết)
+    # ══════════════════════════════════════════════════════════
+    st.markdown("### 📄 Phần A — Export Linkset")
+    st.caption(
+        "Linkset là file RDF liệt kê tất cả liên kết "
+        "`(Document)–[:REFERENCES]→(Element)` đã được xác nhận, "
+        "tuân thủ cấu trúc `ls:Linkset → ls:1-to-1Link → ls:LinkElement` "
+        "của ISO 21597-1."
+    )
+
+    col_fmt, col_btn_ls = st.columns([2, 3])
+
+    with col_fmt:
+        # Người dùng chọn format serialize
+        fmt_choice = st.selectbox(
+            "Định dạng serialize",
+            options=["turtle", "json-ld", "xml"],
+            format_func=lambda x: {
+                "turtle":  "🐢 Turtle (.ttl) — Dễ đọc, khuyến nghị",
+                "json-ld": "📋 JSON-LD (.jsonld) — Tốt cho web API",
+                "xml":     "📰 RDF/XML (.rdf) — Tương thích rộng nhất",
+            }[x],
+            help=(
+                "Turtle: dễ đọc bằng mắt thường, phù hợp lưu file vật lý.\n"
+                "JSON-LD: dễ xử lý bằng Python/JavaScript, phù hợp cho API.\n"
+                "RDF/XML: tương thích rộng nhất với các công cụ cũ."
+            ),
+        )
+
+    ext_map   = {"turtle": "ttl", "json-ld": "jsonld", "xml": "rdf"}
+    mime_map  = {
+        "turtle":  "text/turtle",
+        "json-ld": "application/ld+json",
+        "xml":     "application/rdf+xml",
+    }
+
+    with col_btn_ls:
+        st.write("")  # Căn chỉnh vertical
+        st.write("")
+        if st.button("🔄 Tạo Linkset từ Neo4j", type="primary",
+                     use_container_width=True, key="gen_linkset"):
+            with st.spinner("Đang query Neo4j và serialize RDF..."):
+                resp = api_export_linkset(project_id, fmt=fmt_choice)
+            if resp is not None:
+                # Lưu vào session_state để hiển thị preview và nút download
+                st.session_state["linkset_bytes"]    = resp.content
+                st.session_state["linkset_fmt"]      = fmt_choice
+                st.session_state["linkset_filename"] = (
+                    f"linkset_{project_id}.{ext_map[fmt_choice]}"
+                )
+                st.success(
+                    f"✅ Linkset được tạo thành công! "
+                    f"Kích thước: **{len(resp.content) / 1024:.1f} KB**"
+                )
+
+    # Preview và nút download — chỉ hiện sau khi đã generate
+    if "linkset_bytes" in st.session_state and st.session_state["linkset_bytes"]:
+        linkset_str = st.session_state["linkset_bytes"].decode("utf-8")
+
+        with st.expander(
+            f"👁️ Xem trước nội dung "
+            f"`{st.session_state['linkset_filename']}` (200 dòng đầu)",
+            expanded=False
+        ):
+            # Hiển thị với syntax highlighting giả lập qua code block
+            preview_lines = linkset_str.split("\n")[:200]
+            lang = "turtle" if st.session_state["linkset_fmt"] == "turtle" else "json"
+            st.code("\n".join(preview_lines), language=lang)
+            if len(linkset_str.split("\n")) > 200:
+                st.caption(
+                    f"_(Hiển thị 200/{len(linkset_str.split(chr(10)))} dòng. "
+                    "Tải file để xem đầy đủ.)_"
+                )
+
+        st.download_button(
+            label=f"📥 Tải xuống {st.session_state['linkset_filename']}",
+            data=st.session_state["linkset_bytes"],
+            file_name=st.session_state["linkset_filename"],
+            mime=mime_map[st.session_state["linkset_fmt"]],
+            type="primary",
+            use_container_width=True,
+        )
+
+    st.divider()
+
+    # ══════════════════════════════════════════════════════════
+    # PHẦN B — Export Container.rdf (file index bắt buộc)
+    # ══════════════════════════════════════════════════════════
+    st.markdown("### 🗂️ Phần B — Tạo Container.rdf")
+    st.caption(
+        "Container.rdf là file INDEX bắt buộc nằm ở root của ICDD package. "
+        "Nó liệt kê tất cả tài liệu, linkset, và ontology có trong package, "
+        "tương tự như file `manifest.json` trong các định dạng đóng gói khác."
+    )
+
+    if st.button("🔄 Tạo Container.rdf", use_container_width=True,
+                 key="gen_container"):
+        with st.spinner("Đang lấy danh sách tài liệu từ Neo4j..."):
+            resp = api_export_container(project_id)
+        if resp is not None:
+            st.session_state["container_bytes"] = resp.content
+            st.success(
+                f"✅ Container.rdf được tạo thành công! "
+                f"Kích thước: **{len(resp.content) / 1024:.1f} KB**"
+            )
+
+    if "container_bytes" in st.session_state and st.session_state["container_bytes"]:
+        with st.expander("👁️ Xem trước nội dung Container.rdf", expanded=False):
+            container_str = st.session_state["container_bytes"].decode("utf-8")
+            st.code(container_str[:5000], language="xml")
+            if len(container_str) > 5000:
+                st.caption("_(Chỉ hiển thị 5000 ký tự đầu.)_")
+
+        st.download_button(
+            label="📥 Tải xuống Container.rdf",
+            data=st.session_state["container_bytes"],
+            file_name="Container.rdf",
+            mime="application/rdf+xml",
+            type="primary",
+            use_container_width=True,
+        )
+
+    st.divider()
+
+    # ══════════════════════════════════════════════════════════
+    # PHẦN C — Đóng gói ICDD hoàn chỉnh (one-click)
+    # ══════════════════════════════════════════════════════════
+    st.markdown("### 📦 Phần C — Đóng gói ICDD hoàn chỉnh (.icdd)")
+
+    # Hướng dẫn hoàn thiện package
+    with st.expander(
+        "📋 Các bước để có ICDD package hoàn chỉnh 100%", expanded=True
+    ):
+        st.markdown(f"""
+Nút bên dưới tạo file `.icdd` chứa:
+- ✅ `Container.rdf` (tự động từ Neo4j)
+- ✅ `Linkset Documents/linkset_{project_id}.ttl` (tự động từ Neo4j)
+- ⚠️ `Payload Documents/` — **thư mục rỗng** (bạn cần tự thêm file)
+- ⚠️ `Ontology Resources/` — **thư mục rỗng** (bạn cần tự thêm file)
+
+**Sau khi tải về, để hoàn thiện:**
+
+**Bước 1** — Giải nén file `.icdd` (đổi đuôi thành `.zip` nếu cần)
+
+**Bước 2** — Sao chép các tài liệu gốc vào `Payload Documents/`:
+```
+Biên bản Nghiệm thu Vật liệu.pdf
+SNT-DEF-ARC-DOOR-L1-MAIN-v1.pdf
+Nhật_ký_thi_công_20_05_2026.docx
+Snowdon Towers Sample Structural.ifc
+... (tất cả file trong thư mục Payload Documents của bạn)
+```
+
+**Bước 3** — Sao chép ontology vào `Ontology Resources/`:
+```
+IFC2X3_Final.ttl   (từ thư mục Ontology Resources của bạn)
+bot.ttl            (từ thư mục Ontology Resources của bạn)
+```
+
+**Bước 4** — Nén lại thành ZIP, đổi đuôi thành `.icdd`
+
+**Bước 5** — Kiểm tra bằng [ICDD Checker](https://bimspec.eu/icdd-checker/) 
+hoặc import vào Bimspot / Trimble Connect.
+        """)
+
+    col_pkg, col_info = st.columns([1, 1])
+
+    with col_pkg:
+        if st.button(
+            "🚀 Tạo & Tải ICDD Package",
+            type="primary",
+            use_container_width=True,
+            key="gen_icdd",
+        ):
+            with st.spinner(
+                "Đang đóng gói ICDD... "
+                "(query Neo4j → xây dựng 2 RDF graphs → đóng gói ZIP)"
+            ):
+                resp = api_package_icdd(project_id)
+
+            if resp is not None:
+                st.session_state["icdd_bytes"] = resp.content
+                st.success(
+                    f"✅ ICDD Package sẵn sàng! "
+                    f"Kích thước ZIP: **{len(resp.content) / 1024:.1f} KB**"
+                )
+
+    with col_info:
+        st.info(
+            "💡 File `.icdd` là ZIP với cấu trúc chuẩn ISO 21597-1. "
+            "Các công cụ như **Bimspot**, **Trimble Connect**, hay "
+            "**LBD Server** có thể đọc và visualize trực tiếp file này."
+        )
+
+    # Nút download chỉ hiện sau khi đã generate
+    if "icdd_bytes" in st.session_state and st.session_state["icdd_bytes"]:
+        st.download_button(
+            label=f"📥 Tải xuống {project_id}_ICDD_package.icdd",
+            data=st.session_state["icdd_bytes"],
+            file_name=f"{project_id}_ICDD_package.icdd",
+            mime="application/zip",
+            type="primary",
+            use_container_width=True,
+        )
+
+    st.divider()
+
+    # ══════════════════════════════════════════════════════════
+    # PHẦN D — Roadmap: Những gì CHƯA đủ và bước tiếp theo
+    # ══════════════════════════════════════════════════════════
+    st.markdown("### 🗺️ Roadmap: Từ Linkset đến trải nghiệm tương tác đầy đủ")
+
+    st.markdown("""
+File Linkset `.ttl` bạn vừa tạo là **nền tảng ngữ nghĩa** — nhưng ba use case 
+tương tác nâng cao cần thêm các lớp hạ tầng bổ sung. 
+Bảng dưới đây cho thấy mức độ sẵn sàng hiện tại:
+    """)
+
+    roadmap_data = {
+        "Use case": [
+            "Click GlobalId → xem tất cả tài liệu liên quan",
+            "Tìm kiếm: tài liệu nào nhắc đến cấu kiện X?",
+            "Highlight text trong PDF khi đề cập đến cấu kiện",
+            "Click text → 3D viewer zoom đến cấu kiện",
+        ],
+        "Trạng thái": [
+            "✅ Sẵn sàng",
+            "✅ Sẵn sàng",
+            "🔶 Cần thêm dữ liệu",
+            "🔴 Cần xây thêm lớp mới",
+        ],
+        "Cần thêm gì": [
+            "Thêm endpoint GET /elements/<globalId>/documents",
+            "Query Neo4j MATCH (d)-[:REFERENCES]->(e {globalId: $gid})",
+            "Lưu thêm page + text_bbox vào field 'evidence' trong Neo4j",
+            "Geometry từ IFC + tích hợp IFC.js hoặc xeokit viewer",
+        ],
+        "Độ khó": ["Dễ (1 ngày)", "Dễ (1 ngày)", "Trung bình (1 tuần)", "Khó (3-4 tuần)"],
+    }
+
+    import pandas as pd
+    df_roadmap = pd.DataFrame(roadmap_data)
+    st.dataframe(
+        df_roadmap,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Use case":      st.column_config.TextColumn(width="large"),
+            "Trạng thái":    st.column_config.TextColumn(width="medium"),
+            "Cần thêm gì":   st.column_config.TextColumn(width="large"),
+            "Độ khó":        st.column_config.TextColumn(width="medium"),
+        }
+    )
+
+    st.info(
+        "**Bước ngắn hạn được đề xuất:** Thêm endpoint "
+        "`GET /api/projects/<pid>/elements/<globalId>/documents` "
+        "để enable Use case 1 & 2 ngay lập tức — đây là tính năng "
+        "có giá trị thực tế cao nhất và chi phí triển khai thấp nhất."
+    )
