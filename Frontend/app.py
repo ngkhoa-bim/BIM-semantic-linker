@@ -179,8 +179,14 @@ def validate_and_normalize_icdd_zip(zip_bytes: bytes, project_id: str) -> dict:
             "icdd_bytes": None,
         }
 
-    raw_names = [_n.replace("\\", "/").strip("/") for _n in src.namelist()]
-    meaningful_raw = [n for n in raw_names if _is_meaningful_zip_file(n)]
+    infos = src.infolist()
+    meaningful_raw = []
+    for info in infos:
+        original_name = info.filename.replace("\\", "/")
+        if info.is_dir():
+            continue
+        if _is_meaningful_zip_file(original_name):
+            meaningful_raw.append(original_name.strip("/"))
     normalized_names, stripped_root = _strip_single_root_folder(meaningful_raw)
 
     # Map tên đã chuẩn hoá -> tên gốc trong ZIP để copy bytes sang package cuối.
