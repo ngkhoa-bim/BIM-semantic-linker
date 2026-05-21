@@ -8,6 +8,7 @@
 import os
 import uuid
 import io
+import zipfile
 
 import requests
 import pandas as pd
@@ -118,6 +119,164 @@ def extract_text(uploaded_file) -> str:
     return ""
 
 
+
+# ──────────────────────────────────────────────────────────────
+# ICDD ZIP helpers — validate và chuẩn hoá package người dùng upload
+# ──────────────────────────────────────────────────────────────
+def _is_meaningful_zip_file(name: str) -> bool:
+    """Bỏ qua folder entry, file hệ thống và placeholder rỗng."""
+    clean = name.replace("\\", "/").strip("/")
+    if not clean or clean.endswith("/"):
+        return False
+    parts = clean.split("/")
+    if any(part in {"__MACOSX", ".DS_Store", "Thumbs.db"} for part in parts):
+        return False
+    if parts[-1] in {".gitkeep", ".DS_Store", "Thumbs.db"}:
+        return False
+    return True
+
+
+def _strip_single_root_folder(names: list[str]) -> tuple[list[str], str | None]:
+    """
+    Nếu người dùng nén cả thư mục cha, ví dụ:
+        SNT_ICDD_starter/Container.rdf
+    thì tự động chuẩn hoá về:
+        Container.rdf
+    để file .icdd cuối cùng đúng cấu trúc root của ICDD.
+    """
+    normalized = [n.replace("\\", "/").strip("/") for n in names]
+    if "Container.rdf" in normalized:
+        return normalized, None
+
+    first_parts = [n.split("/", 1)[0] for n in normalized if "/" in n]
+    if not first_parts:
+        return normalized, None
+
+    unique_roots = set(first_parts)
+    if len(unique_roots) == 1:
+        root = next(iter(unique_roots))
+        candidate = f"{root}/Container.rdf"
+        if candidate in normalized:
+            stripped = [n[len(root) + 1:] if n.startswith(root + "/") else n for n in normalized]
+            return stripped, root
+
+    return normalized, None
+
+
+def validate_and_normalize_icdd_zip(zip_bytes: bytes, project_id: str) -> dict:
+    """
+    Kiểm tra ZIP đã bổ sung payload/ontology và trả về bytes đã chuẩn hoá.
+    Không giải nén ra ổ đĩa; chỉ xử lý trong bộ nhớ để an toàn và phù hợp Render.
+    """
+    try:
+        src = zipfile.ZipFile(io.BytesIO(zip_bytes), "r")
+    except zipfile.BadZipFile:
+        return {
+            "ok": False,
+            "errors": ["File upload không phải ZIP hợp lệ."],
+            "warnings": [],
+            "summary": {},
+            "icdd_bytes": None,
+        }
+
+    raw_names = [_n.replace("\\", "/").strip("/") for _n in src.namelist()]
+    meaningful_raw = [n for n in raw_names if _is_meaningful_zip_file(n)]
+    normalized_names, stripped_root = _strip_single_root_folder(meaningful_raw)
+
+    # Map tên đã chuẩn hoá -> tên gốc trong ZIP để copy bytes sang package cuối.
+    name_map = {}
+    if stripped_root:
+        for raw in meaningful_raw:
+            if raw.startswith(stripped_root + "/"):
+                name_map[raw[len(stripped_root) + 1:]] = raw
+            else:
+                name_map[raw] = raw
+    else:
+        name_map = {raw: raw for raw in meaningful_raw}
+
+    names = sorted(name_map.keys())
+    errors = []
+    warnings = []
+
+    has_container = "Container.rdf" in names
+    linkset_files = [
+        n for n in names
+        if n.startswith("Linkset Documents/")
+        and n.lower().endswith((".ttl", ".rdf", ".jsonld"))
+    ]
+    payload_files = [
+        n for n in names
+        if n.startswith("Payload Documents/")
+        and _is_meaningful_zip_file(n)
+    ]
+    ontology_files = [
+        n for n in names
+        if n.startswith("Ontology Resources/")
+        and _is_meaningful_zip_file(n)
+    ]
+
+    if not has_container:
+        errors.append("Thiếu `Container.rdf` ở root của ZIP.")
+    if not linkset_files:
+        errors.append("Thiếu file linkset trong `Linkset Documents/`, ví dụ `linkset_{}.ttl`.".format(project_id))
+    if not payload_files:
+        errors.append("`Payload Documents/` chưa có tài liệu gốc PDF/DOCX/XLSX/IFC.")
+    if not ontology_files:
+        errors.append("`Ontology Resources/` chưa có ontology tham chiếu, ví dụ `bot.ttl`, `IFC2X3_Final.ttl`.")
+
+    if stripped_root:
+        warnings.append(
+            f"Đã phát hiện ZIP có thư mục cha `{stripped_root}/`; app sẽ tự bỏ lớp này khi xuất `.icdd`."
+        )
+
+    expected_linkset = f"Linkset Documents/linkset_{project_id}.ttl"
+    if linkset_files and expected_linkset not in linkset_files:
+        warnings.append(
+            f"Không thấy `{expected_linkset}`; vẫn chấp nhận vì có file linkset RDF khác."
+        )
+
+    lower_ontology = {n.split("/")[-1].lower() for n in ontology_files}
+    if ontology_files and "bot.ttl" not in lower_ontology:
+        warnings.append("Khuyến nghị bổ sung `bot.ttl` vào `Ontology Resources/`.")
+    if ontology_files and not any("ifc" in f and f.endswith(".ttl") for f in lower_ontology):
+        warnings.append("Khuyến nghị bổ sung ontology IFC, ví dụ `IFC2X3_Final.ttl`, vào `Ontology Resources/`.")
+
+    summary = {
+        "Container.rdf": 1 if has_container else 0,
+        "Linkset Documents": len(linkset_files),
+        "Payload Documents": len(payload_files),
+        "Ontology Resources": len(ontology_files),
+    }
+
+    if errors:
+        return {
+            "ok": False,
+            "errors": errors,
+            "warnings": warnings,
+            "summary": summary,
+            "icdd_bytes": None,
+        }
+
+    # Ghi lại ZIP đã chuẩn hoá. File `.icdd` thực chất là ZIP, chỉ khác phần mở rộng.
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as dst:
+        # đảm bảo các thư mục chính luôn tồn tại
+        for folder in ["Payload Documents/", "Linkset Documents/", "Ontology Resources/"]:
+            dst.writestr(folder, b"")
+
+        for normalized_name in names:
+            src_name = name_map[normalized_name]
+            dst.writestr(normalized_name, src.read(src_name))
+
+    return {
+        "ok": True,
+        "errors": [],
+        "warnings": warnings,
+        "summary": summary,
+        "icdd_bytes": out.getvalue(),
+        "files": names,
+    }
+
 # ──────────────────────────────────────────────────────────────
 # Backend API helpers — tất cả request đều qua đây
 # ──────────────────────────────────────────────────────────────
@@ -155,7 +314,6 @@ def api_get_anchors(project_id: str) -> dict:
         return r.json()
     except Exception as e:
         return {"error": str(e)}
-
 
 def api_analyze(project_id: str, doc_name: str, doc_text: str) -> dict:
     try:
@@ -427,7 +585,6 @@ with tab_ifc:
                 # Hiển thị các cột quan trọng
                 cols_show = [c for c in ["globalId", "name", "ifcType", "mark", "reference", "tag", "storey"] if c in df_anchors.columns]
                 st.dataframe(df_anchors[cols_show], use_container_width=True)
-
 
 # ══════════════════════════════════════════════════════════════
 # TAB 2 — Document Analysis
@@ -936,10 +1093,10 @@ with tab_links:
                 for s in confirmed_this_session
             ])
             st.dataframe(df_session, use_container_width=True)
+
 # ══════════════════════════════════════════════════════════════
 # TAB 4 — Xuất ICDD / Linkset
 # ══════════════════════════════════════════════════════════════
-
 with tab_icdd:
 
     st.subheader("📦 Xuất ICDD Container theo ISO 21597-1")
@@ -1097,84 +1254,155 @@ không phải URN tạm thời.
     st.divider()
 
     # ══════════════════════════════════════════════════════════
-    # PHẦN C — Đóng gói ICDD hoàn chỉnh (one-click)
+    # PHẦN C — Workflow 4 bước: Starter ZIP → bổ sung file → validate → xuất .icdd
     # ══════════════════════════════════════════════════════════
-    st.markdown("### 📦 Phần C — Đóng gói ICDD hoàn chỉnh (.icdd)")
+    st.markdown("### 📦 Phần C — Đóng gói ICDD hoàn chỉnh")
 
-    # Hướng dẫn hoàn thiện package
-    with st.expander(
-        "📋 Các bước để có ICDD package hoàn chỉnh 100%", expanded=True
-    ):
+    with st.expander("📋 Quy trình 4 bước để có ICDD package hoàn chỉnh 100%", expanded=True):
         st.markdown(f"""
-Nút bên dưới tạo file `.icdd` chứa:
-- ✅ `Container.rdf` (tự động từ Neo4j)
-- ✅ `Linkset Documents/linkset_{project_id}.ttl` (tự động từ Neo4j)
-- ⚠️ `Payload Documents/` — **thư mục rỗng** (bạn cần tự thêm file)
-- ⚠️ `Ontology Resources/` — **thư mục rỗng** (bạn cần tự thêm file)
+Workflow tránh thao tác thủ công, chỉ làm việc với file ZIP trong bước bổ sung nội dung; app sẽ kiểm tra và xuất `.icdd` cuối cùng.
 
-**Sau khi tải về, để hoàn thiện:**
+| Bước | Việc cần làm | Kết quả |
+|---|---|---|
+| **1** | Tạo và tải bộ khung metadata-only dạng ZIP | `SNT_ICDD_starter.zip` hoặc `{project_id}_ICDD_starter.zip` |
+| **2** | Giải nén ZIP, bổ sung tài liệu gốc và ontology | `Payload Documents/` và `Ontology Resources/` không còn rỗng |
+| **3** | Upload lại ZIP đã bổ sung vào app | App kiểm tra cấu trúc ICDD |
+| **4** | Nếu hợp lệ, tải file `.icdd` cuối cùng | `{project_id}_ICDD_package.icdd` |
 
-**Bước 1** — Giải nén file `.icdd` (đổi đuôi thành `.zip` nếu cần)
-
-**Bước 2** — Sao chép các tài liệu gốc vào `Payload Documents/`:
-```
-Biên bản Nghiệm thu Vật liệu.pdf
-SNT-DEF-ARC-DOOR-L1-MAIN-v1.pdf
-Nhật_ký_thi_công_20_05_2026.docx
-Snowdon Towers Sample Structural.ifc
-... (tất cả file trong thư mục Payload Documents của bạn)
-```
-
-**Bước 3** — Sao chép ontology vào `Ontology Resources/`:
-```
-IFC2X3_Final.ttl   (từ thư mục Ontology Resources của bạn)
-bot.ttl            (từ thư mục Ontology Resources của bạn)
-```
-
-**Bước 4** — Nén lại thành ZIP, đổi đuôi thành `.icdd`
-
-**Bước 5** — Kiểm tra bằng [ICDD Checker](https://bimspec.eu/icdd-checker/) 
-hoặc import vào Bimspot / Trimble Connect.
+Bộ khung ZIP ở bước 1 chứa sẵn:
+- ✅ `Container.rdf` — metadata/index tự động từ Neo4j
+- ✅ `Linkset Documents/linkset_{project_id}.ttl` — linkset tự động từ Neo4j
+- ⚠️ `Payload Documents/` — cần thêm tài liệu gốc: PDF, DOCX, XLSX, IFC
+- ⚠️ `Ontology Resources/` — cần thêm ontology: `bot.ttl`, `IFC2X3_Final.ttl`, v.v.
         """)
 
-    col_pkg, col_info = st.columns([1, 1])
+    st.markdown("#### Bước 1 — Tải bộ khung ICDD metadata-only package dạng ZIP")
+    st.caption(
+        "File tải xuống là ZIP để bạn giải nén và bổ sung nội dung dễ dàng trên Windows. "
+        "Đây chưa phải package ICDD hoàn chỉnh vì chưa chứa tài liệu gốc và ontology."
+    )
 
-    with col_pkg:
+    col_starter, col_starter_info = st.columns([1, 1])
+
+    with col_starter:
         if st.button(
-            "🚀 Tạo & Tải ICDD Package",
+            "🚀 Tạo bộ khung ICDD metadata-only package",
             type="primary",
             use_container_width=True,
-            key="gen_icdd",
+            key="gen_icdd_starter_zip",
         ):
             with st.spinner(
-                "Đang đóng gói ICDD... "
-                "(query Neo4j → xây dựng 2 RDF graphs → đóng gói ZIP)"
+                "Đang tạo bộ khung ICDD metadata-only... "
+                "(query Neo4j → tạo Container.rdf + Linkset → đóng gói ZIP)"
             ):
                 resp = api_package_icdd(project_id)
 
             if resp is not None:
-                st.session_state["icdd_bytes"] = resp.content
+                st.session_state["icdd_starter_zip_bytes"] = resp.content
                 st.success(
-                    f"✅ ICDD Package sẵn sàng! "
+                    f"✅ Bộ khung ICDD metadata-only đã sẵn sàng! "
                     f"Kích thước ZIP: **{len(resp.content) / 1024:.1f} KB**"
                 )
 
-    with col_info:
+    with col_starter_info:
         st.info(
-            "💡 File `.icdd` là ZIP với cấu trúc chuẩn ISO 21597-1. "
-            "Các công cụ như **Bimspot**, **Trimble Connect**, hay "
-            "**LBD Server** có thể đọc và visualize trực tiếp file này."
+            "💡 tải `.zip`, bổ sung file, rồi upload lại để app tự xuất `.icdd`."
         )
 
-    # Nút download chỉ hiện sau khi đã generate
-    if "icdd_bytes" in st.session_state and st.session_state["icdd_bytes"]:
+    if "icdd_starter_zip_bytes" in st.session_state and st.session_state["icdd_starter_zip_bytes"]:
+        st.download_button(
+            label=f"📥 Tải bộ khung ICDD metadata-only package dạng ZIP — {project_id}_ICDD_starter.zip",
+            data=st.session_state["icdd_starter_zip_bytes"],
+            file_name=f"{project_id}_ICDD_starter.zip",
+            mime="application/zip",
+            type="primary",
+            use_container_width=True,
+        )
+
+    st.markdown("#### Bước 2 — Giải nén ZIP và bổ sung file còn thiếu")
+    st.markdown("""
+Sau khi tải `*_ICDD_starter.zip`, hãy giải nén và bổ sung:
+
+**Thêm vào `Payload Documents/`:**
+```text
+Biên bản Nghiệm thu Vật liệu.pdf
+SNT-DEF-ARC-DOOR-L1-MAIN-v1.pdf
+Nhật_ký_thi_công_20_05_2026.docx
+Snowdon Towers Sample Structural.ifc
+... các tài liệu gốc khác của dự án
+```
+
+**Thêm vào `Ontology Resources/`:**
+```text
+bot.ttl
+IFC2X3_Final.ttl
+... ontology tham chiếu khác nếu có
+```
+
+Sau đó nén lại thành một file `.zip`.
+    """)
+
+    st.markdown("#### Bước 3 — Upload ZIP đã bổ sung Payload Documents và Ontology Resources")
+    completed_zip = st.file_uploader(
+        "Tải lên ZIP đã bổ sung file",
+        type=["zip"],
+        key="completed_icdd_zip_upload",
+        help=(
+            "ZIP cần có Container.rdf ở root, Linkset Documents/, Payload Documents/, "
+            "và Ontology Resources/ để app có thể tự chuẩn hoá."
+        ),
+    )
+
+    if completed_zip is not None:
+        zip_bytes = completed_zip.getvalue()
+        with st.spinner("Đang kiểm tra cấu trúc ICDD trong ZIP..."):
+            validation = validate_and_normalize_icdd_zip(zip_bytes, project_id)
+
+        summary = validation.get("summary", {})
+        if summary:
+            st.write("**Tóm tắt nội dung phát hiện trong ZIP:**")
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {"Thành phần": k, "Số lượng": v}
+                        for k, v in summary.items()
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        for warning in validation.get("warnings", []):
+            st.warning(f"⚠️ {warning}")
+
+        if not validation.get("ok"):
+            st.error("❌ ZIP chưa đủ điều kiện để xuất ICDD package hoàn chỉnh.")
+            for err in validation.get("errors", []):
+                st.markdown(f"- {err}")
+        else:
+            st.session_state["validated_icdd_bytes"] = validation["icdd_bytes"]
+            st.success("✅ Package đã đủ cấu trúc ICDD")
+
+            with st.expander("👁️ Xem danh sách file sẽ được đóng gói vào `.icdd`", expanded=False):
+                files_df = pd.DataFrame(
+                    [{"Đường dẫn trong package": n} for n in validation.get("files", [])]
+                )
+                st.dataframe(files_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Bước 4 — Tải xuống ICDD package hoàn chỉnh")
+    if "validated_icdd_bytes" in st.session_state and st.session_state["validated_icdd_bytes"]:
+        st.success("✅ Package đã đủ cấu trúc ICDD")
         st.download_button(
             label=f"📥 Tải xuống {project_id}_ICDD_package.icdd",
-            data=st.session_state["icdd_bytes"],
+            data=st.session_state["validated_icdd_bytes"],
             file_name=f"{project_id}_ICDD_package.icdd",
             mime="application/zip",
             type="primary",
             use_container_width=True,
+        )
+    else:
+        st.info(
+            "Đã upload ZIP hợp lệ ở Bước 3, nút tải `.icdd` sẽ xuất hiện."
         )
 
     st.divider()
